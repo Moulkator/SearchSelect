@@ -1,0 +1,19 @@
+v1.0.4 - GitHub Release (24/06/2026)
+- Compatibility with the mod version checker from _Lib
+
+v1.0.3 (23/06/2026)
+- Underscores are now ignored
+- The order of the words can now be mix
+
+–> “Wooden Table 02” and “table_02_wooden” will select the same assets.
+
+ 
+v1.0.2 (18/06/2026)
+- Use CTRL + F in the Selection Tool to open the Search and Select popup
+
+
+v1.0.1 (15/12/2025)
+- Now works with mods from uchideshi34
+
+
+v1.0.0 - Discord & Cartography Assets Release (05/07/2025) 
