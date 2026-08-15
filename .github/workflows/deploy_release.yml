@@ -29,14 +29,18 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+      - name: Create versioned folder
+        run: mkdir -p SearchSelect_${{ needs.check-version.outputs.version }}
+      - name: Copy files recursively
+        run: cp -r SearchSelect/. SearchSelect_${{ needs.check-version.outputs.version }}/
       - name: Zip Release
-        run: zip -r SearchSelect.zip SearchSelect
+        run: zip -r SearchSelect_${{ needs.check-version.outputs.version }}.zip SearchSelect_${{ needs.check-version.outputs.version }}
       - name: Deploy Release
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ needs.check-version.outputs.version }}
           tag_name: ${{ needs.check-version.outputs.version }}
           prerelease: ${{ contains(needs.check-version.outputs.version, '-') }}
-          files: SearchSelect.zip
+          files: SearchSelect_${{ needs.check-version.outputs.version }}.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
