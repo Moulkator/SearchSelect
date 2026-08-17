@@ -1,3 +1,12 @@
+v1.1.0 (16/06/2026)
+
+- Added a second tab in the popup to select similar assets (exact name, name variants, same custom color)
+- Added an option to add to current selection
+- Popup doesn't close automatically anymore so you can add more to your selection
+- Clicking on assets is now possible while the popup is open
+- Slight UI redesign (icon, buttons, text color...)
+- Fixed button being at the bottom of the selection tool when an asset was selected
+
 v1.0.4 - GitHub Release (24/06/2026)
 - Compatibility with the mod version checker from _Lib
 

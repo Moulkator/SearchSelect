@@ -1,7 +1,7 @@
 {
     "name": "Search & Select",
     "unique_id": "Moulk.search_and_select.2",
-    "version": "1.0.4",
+    "version": "1.1.0",
     "author": "Moulk",
     "description": "Select assets that share the same keyword",
     "dd_version": "1.2.0.1"
