@@ -1,6 +1,6 @@
 # Search & Select
 
-Search & Select is the simple Dungeondraft mod that allows you to look for a word and select every asset placed on the map containing that word in their name. You can also add to an existing selection. 
+Search & Select is a simple Dungeondraft mod that allows you to look for a word and select every asset placed on the map containing that word in their name. You can also add to an existing selection. 
 
 A second tab will allow you to select an asset on the map and select all the assets that share the same name, or variants of its name (01, 02, A, B...). It will also let you select all colorable assets that share the same color as the selected one.
 
