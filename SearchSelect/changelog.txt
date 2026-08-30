@@ -1,4 +1,9 @@
-v1.1.0 (16/06/2026)
+SEARCH & SELECT
+
+v1.1.1 (30/08/2026)
+- Added self update checker (popup when there's a new version available)
+
+v1.1.0 (16/08/2026)
 
 - Added a second tab in the popup to select similar assets (exact name, name variants, same custom color)
 - Added an option to add to current selection
