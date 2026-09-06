@@ -20,7 +20,12 @@ var add_selection_check: CheckBox
 var exact_check: CheckBox
 var variants_check: CheckBox
 var color_check: CheckBox
+var tag_check: CheckBox
+var shadow_check: CheckBox
 var similar_hint: Label
+# path -> {tag: true} built lazily from DD's tag database (see _get_tags_index)
+var _tags_index = null
+var _tags_index_world_id = -1
 var _updating_checks = false
 var _variation_regex: RegEx = null
 var _dialog_positioned = false
@@ -183,6 +188,16 @@ func create_search_dialog() -> void:
 	color_check.text = "Same Custom Color"
 	similar_box.add_child(color_check)
 
+	tag_check = CheckBox.new()
+	tag_check.text = "Shared Tag (objects only)"
+	tag_check.hint_tooltip = "Objects that share at least one library tag with the reference"
+	similar_box.add_child(tag_check)
+
+	shadow_check = CheckBox.new()
+	shadow_check.text = "Same Soft Shadow"
+	shadow_check.hint_tooltip = "Same Soft Shadow mod settings (or both without a soft shadow)"
+	similar_box.add_child(shadow_check)
+
 	# Shared option (below both tabs, single state for both modes)
 	add_selection_check = CheckBox.new()
 	add_selection_check.text = "Add to current selection"
@@ -203,6 +218,10 @@ func show_search_dialog() -> void:
 		return
 	# show() instead of popup_centered(): a modal popup would swallow map
 	# clicks, which the Select Similar tab needs to pick a reference asset
+	# Soft Shadow criterion only makes sense when the Soft Shadow mod is loaded
+	shadow_check.visible = _is_soft_shadow_mod_loaded()
+	if not shadow_check.visible:
+		shadow_check.pressed = false
 	search_dialog.show()
 	search_dialog.set_as_minsize()
 	if not _dialog_positioned:
@@ -582,8 +601,10 @@ func get_object_name(obj: Node) -> String:
 #   - Exact Name:        every placed asset with the exact same name
 #   - Name Variants:     same base name, ignoring suffixes (01, 02, A, B...)
 #   - Same Custom Color: colorable objects sharing the same custom color
-# Exact Name and Name Variants are mutually exclusive. When Same Custom
-# Color is combined with a name criterion, both must match (AND).
+#   - Shared Tag:        objects sharing at least one library tag
+#   - Same Soft Shadow:  same Soft Shadow mod settings (or none on both)
+# Exact Name and Name Variants are mutually exclusive. All other checked
+# criteria must match together (AND).
 # =====================================================================
 
 func _refresh_similar_hint(selected: Array) -> void:
@@ -626,7 +647,9 @@ func run_select_similar() -> void:
 	var use_exact = exact_check.pressed
 	var use_variants = variants_check.pressed
 	var use_color = color_check.pressed
-	if not (use_exact or use_variants or use_color):
+	var use_tags = tag_check.pressed
+	var use_shadow = shadow_check.pressed
+	if not (use_exact or use_variants or use_color or use_tags or use_shadow):
 		print("Select Similar: no criterion checked")
 		return
 
@@ -664,6 +687,22 @@ func run_select_similar() -> void:
 			print("Select Similar: no color found on the selected asset(s)")
 			return
 
+	# Reference tags (union over all references)
+	var ref_tags = {}
+	if use_tags:
+		for r in refs:
+			for t in _get_thing_tags(r):
+				ref_tags[t] = true
+		if ref_tags.empty():
+			print("Select Similar: the selected asset(s) carry no tag")
+			return
+
+	# Reference soft shadow signatures
+	var ref_shadows = {}
+	if use_shadow:
+		for r in refs:
+			ref_shadows[_get_shadow_signature(r)] = true
+
 	var matching = []
 	for thing in _collect_candidates():
 		if use_exact or use_variants:
@@ -678,6 +717,17 @@ func run_select_similar() -> void:
 				continue
 			var c = thing.get("customColor")
 			if c == null or not ref_colors.has(c.to_html()):
+				continue
+		if use_tags:
+			var shared = false
+			for t in _get_thing_tags(thing):
+				if ref_tags.has(t):
+					shared = true
+					break
+			if not shared:
+				continue
+		if use_shadow:
+			if not ref_shadows.has(_get_shadow_signature(thing)):
 				continue
 		matching.push_back(thing)
 
@@ -739,6 +789,138 @@ func _get_reference_color_html(thing) -> String:
 	if col != null and typeof(col) == TYPE_COLOR:
 		return col.to_html()
 	return ""
+
+
+# --- Tag helpers --------------------------------------------------------
+
+# Resource path of the texture placed on the map (key used by DD's tag DB)
+func _get_thing_texture_path(thing) -> String:
+	var tex = thing.get("Texture")
+	if tex is Resource and tex.resource_path != "":
+		return tex.resource_path
+	return ""
+
+
+# Tags of an asset, as an Array of tag names (empty for non-objects)
+func _get_thing_tags(thing) -> Array:
+	if thing.get_parent() == null or thing.get_parent().name != "Objects":
+		return []
+	var path = _get_thing_texture_path(thing)
+	if path.empty():
+		return []
+	var index = _get_tags_index()
+	if index.has(path):
+		return index[path].keys()
+	return []
+
+
+# Builds (and caches per map) a path -> {tag: true} lookup.
+# Source 1: DD's live tag database (Global.Tags), which already merges the
+# default tags with the user's override tags. Source 2 (fallback if the
+# C# collections do not marshal to GDScript): the .dungeondraft_tags files
+# of the default assets and of every pack found on the map.
+func _get_tags_index() -> Dictionary:
+	var world_id = -1
+	if Global.World != null and is_instance_valid(Global.World):
+		world_id = Global.World.get_instance_id()
+	if _tags_index != null and _tags_index_world_id == world_id:
+		return _tags_index
+	_tags_index = {}
+	_tags_index_world_id = world_id
+
+	var live = Global.get("Tags")
+	if live is Dictionary:
+		for tag_name in live:
+			var paths = live[tag_name]
+			if paths == null:
+				continue
+			for p in paths:
+				if p is String:
+					_add_tag(p, str(tag_name))
+
+	if _tags_index.empty():
+		var prefixes = {"res://": true}
+		for obj in Global.World.levels[Global.World.CurrentLevelId].Objects.get_children():
+			var p = _get_thing_texture_path(obj)
+			if p.begins_with("res://packs/"):
+				var rest = p.substr(len("res://packs/"))
+				var slash = rest.find("/")
+				if slash > 0:
+					prefixes["res://packs/" + rest.substr(0, slash) + "/"] = true
+		for prefix in prefixes:
+			_collect_tags_from_file(prefix + "data/default.dungeondraft_tags", prefix)
+
+	print("Select Similar: tag index built for ", _tags_index.size(), " asset path(s)")
+	return _tags_index
+
+
+func _add_tag(path: String, tag_name: String) -> void:
+	if not _tags_index.has(path):
+		_tags_index[path] = {}
+	_tags_index[path][tag_name] = true
+
+
+func _collect_tags_from_file(tags_path: String, path_prefix: String) -> void:
+	var f = File.new()
+	if f.open(tags_path, File.READ) != OK:
+		return
+	var parsed = JSON.parse(f.get_as_text())
+	f.close()
+	if parsed.error != OK or not (parsed.result is Dictionary):
+		return
+	var tags = parsed.result.get("tags", {})
+	if not (tags is Dictionary):
+		return
+	for tag_name in tags:
+		var arr = tags[tag_name]
+		if not (arr is Array):
+			continue
+		for p in arr:
+			if not (p is String) or p.empty():
+				continue
+			# Default tags store absolute res:// paths, packs store relative ones
+			var final_path = p if p.begins_with("res://") else path_prefix + p
+			_add_tag(final_path, str(tag_name))
+
+
+# --- Soft Shadow helper (Soft Shadow mod, ModMapData["DropShadow"]) -----
+
+func _is_soft_shadow_mod_loaded() -> bool:
+	if Engine.has_meta("dropshadow_objects_singleton"):
+		return true
+	var data = Global.ModMapData
+	return data != null and (data.has("_dropshadow_refs") or data.has("DropShadow"))
+
+
+# Comparable signature of an asset's soft shadow: "off" when the mod has no
+# enabled config for it, otherwise its config serialized with stable key
+# order (UI/performance-only keys are ignored).
+func _get_shadow_signature(thing) -> String:
+	if not thing.has_meta("node_id"):
+		return "off"
+	var data = Global.ModMapData
+	if data == null or not data.has("DropShadow"):
+		return "off"
+	var store = data["DropShadow"]
+	var node_id = str(thing.get_meta("node_id"))
+	if not (store is Dictionary) or not store.has(node_id):
+		return "off"
+	var cfg = store[node_id]
+	if not (cfg is Dictionary) or not cfg.get("enabled", false):
+		return "off"
+	var keys = cfg.keys()
+	keys.sort()
+	var parts = []
+	for k in keys:
+		if k == "enabled" or k == "settings_open" or k == "quality":
+			continue
+		var v = cfg[k]
+		if v is Color:
+			v = v.to_html()
+		elif v is float:
+			v = "%.4f" % v
+		parts.push_back(str(k) + "=" + str(v))
+	return PoolStringArray(parts).join("|")
 
 
 # --- Candidate collection (respects type and layer filters) -----------

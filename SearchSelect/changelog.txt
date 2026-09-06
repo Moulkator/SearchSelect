@@ -1,5 +1,9 @@
 SEARCH & SELECT
 
+v1.1.2 (06/09/2026)
+- New option: Tag search
+- New option: Soft Shadow search
+
 v1.1.1 (30/08/2026)
 - Added self update checker (popup when there's a new version available)
 
