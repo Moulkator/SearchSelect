@@ -17,6 +17,7 @@ var tabs: Tabs
 var keyword_box: VBoxContainer
 var similar_box: VBoxContainer
 var add_selection_check: CheckBox
+var remove_selection_check: CheckBox
 var exact_check: CheckBox
 var variants_check: CheckBox
 var color_check: CheckBox
@@ -201,7 +202,16 @@ func create_search_dialog() -> void:
 	# Shared option (below both tabs, single state for both modes)
 	add_selection_check = CheckBox.new()
 	add_selection_check.text = "Add to current selection"
+	add_selection_check.connect("toggled", self, "_on_add_selection_toggled")
 	root_box.add_child(add_selection_check)
+
+	# Subtractive mode: matches are removed from the current selection
+	# (mutually exclusive with "Add to current selection")
+	remove_selection_check = CheckBox.new()
+	remove_selection_check.text = "Remove from current selection"
+	remove_selection_check.hint_tooltip = "Deselect the matching assets instead of selecting them"
+	remove_selection_check.connect("toggled", self, "_on_remove_selection_toggled")
+	root_box.add_child(remove_selection_check)
 	
 	# Connexion de la touche Entree
 	search_input.connect("text_entered", self, "_on_search_entered")
@@ -300,7 +310,18 @@ func search_and_select_all() -> void:
 	var search_term = search_input.text.strip_edges().to_lower()
 	if search_term.empty():
 		return
-	
+
+	# Subtractive mode: deselect the selected things matching the term
+	if remove_selection_check.pressed:
+		var to_remove = {}
+		for thing in select_tool.Selected:
+			if not is_instance_valid(thing):
+				continue
+			if _name_matches(_get_thing_name(thing).to_lower(), search_term):
+				to_remove[thing.get_instance_id()] = true
+		var removed = _remove_from_selection(to_remove)
+		print("Removed ", removed, " thing(s) matching '", search_term, "' from the selection")
+		return
 	
 	var currentLevel = Global.World.levels[Global.World.CurrentLevelId]
 	var matching_objects = []
@@ -608,7 +629,8 @@ func get_object_name(obj: Node) -> String:
 # =====================================================================
 
 func _refresh_similar_hint(selected: Array) -> void:
-	var sig = str(selected.size())
+	var removing = remove_selection_check.pressed
+	var sig = str(selected.size()) + ("r" if removing else "s")
 	if selected.size() > 0 and is_instance_valid(selected[0]):
 		sig += "_" + str(selected[0].get_instance_id())
 	if sig == _last_ref_sig:
@@ -621,7 +643,10 @@ func _refresh_similar_hint(selected: Array) -> void:
 		var ref_name = ""
 		if is_instance_valid(selected[0]):
 			ref_name = _get_thing_name(selected[0])
-		if selected.size() > 1:
+		if removing:
+			# Subtractive mode only uses the first selected asset as reference
+			similar_hint.text = "Reference: %s (first of %d selected)" % [ref_name, selected.size()]
+		elif selected.size() > 1:
 			similar_hint.text = "Reference: %s (+%d more)" % [ref_name, selected.size() - 1]
 		else:
 			similar_hint.text = "Reference: %s" % ref_name
@@ -643,6 +668,48 @@ func _on_variants_toggled(pressed: bool) -> void:
 		_updating_checks = false
 
 
+func _on_add_selection_toggled(pressed: bool) -> void:
+	if _updating_checks: return
+	if pressed:
+		_updating_checks = true
+		remove_selection_check.pressed = false
+		_updating_checks = false
+	_last_ref_sig = "-"
+
+
+func _on_remove_selection_toggled(pressed: bool) -> void:
+	if _updating_checks: return
+	if pressed:
+		_updating_checks = true
+		add_selection_check.pressed = false
+		_updating_checks = false
+	_last_ref_sig = "-"
+
+
+# Deselects the things whose instance id is a key of to_remove and keeps the
+# rest selected. Rebuilds the selection (DeselectAll + reselect) so it does
+# not depend on a per-thing deselect method. Returns the removed count.
+func _remove_from_selection(to_remove: Dictionary) -> int:
+	var keep = []
+	var removed = 0
+	for thing in select_tool.Selected:
+		if not is_instance_valid(thing):
+			continue
+		if to_remove.has(thing.get_instance_id()):
+			removed += 1
+		else:
+			keep.push_back(thing)
+	if removed == 0:
+		return 0
+	select_tool.DeselectAll()
+	for thing in keep:
+		select_tool.SelectThing(thing, true)
+	if keep.size() > 0:
+		select_tool.OnFinishSelection()
+		select_tool_panel.OnSelect(get_selected_selectable_type())
+	return removed
+
+
 func run_select_similar() -> void:
 	var use_exact = exact_check.pressed
 	var use_variants = variants_check.pressed
@@ -661,6 +728,16 @@ func run_select_similar() -> void:
 	if refs.empty():
 		print("Select Similar: select at least one reference asset first")
 		return
+
+	# Subtractive mode: the first selected asset is the only reference and
+	# only the currently selected things can be removed
+	var removing = remove_selection_check.pressed
+	var candidates = []
+	if removing:
+		candidates = refs.duplicate()
+		refs = [refs[0]]
+	else:
+		candidates = _collect_candidates()
 
 	# Reference names (exact or base names)
 	var ref_names = {}
@@ -704,7 +781,7 @@ func run_select_similar() -> void:
 			ref_shadows[_get_shadow_signature(r)] = true
 
 	var matching = []
-	for thing in _collect_candidates():
+	for thing in candidates:
 		if use_exact or use_variants:
 			var n = _normalize_name(_get_thing_name(thing))
 			if use_variants:
@@ -737,6 +814,12 @@ func run_select_similar() -> void:
 		final_set[r.get_instance_id()] = r
 	for m in matching:
 		final_set[m.get_instance_id()] = m
+
+	if removing:
+		# The reference itself is removed along with its matches
+		var removed = _remove_from_selection(final_set)
+		print("Select Similar: removed ", removed, " thing(s) from the selection")
+		return
 
 	# Clear current selection unless additive mode is enabled
 	if not add_selection_check.pressed:
