@@ -14,6 +14,7 @@ var filter_button_enabled = false
 
 # --- Select Similar (search by selected asset) ---
 var tabs: Tabs
+var root_box: VBoxContainer
 var keyword_box: VBoxContainer
 var similar_box: VBoxContainer
 var add_selection_check: CheckBox
@@ -32,8 +33,42 @@ var _variation_regex: RegEx = null
 var _dialog_positioned = false
 var _last_ref_sig = ""
 
+# --- Find in Library (show library assets matching a placed asset's name) ---
+const TAB_KEYWORD = 0
+const TAB_SIMILAR = 1
+const TAB_LIBRARY = 2
+var lookup_box: VBoxContainer
+var lookup_hint: Label
+var lookup_words_grid: GridContainer
+var lookup_any_check: CheckBox
+var lookup_plural_check: CheckBox
+var lookup_count_label: Label
+var lookup_strictness: HSlider
+# Cached copy of ObjectLibraryPanel.searchEngine (see _get_search_engine)
+var _se_cache = {}
+var _se_retry_at = 0
+# word -> [index keys, similarities], for the current plural option
+var _word_sims = {}
+# word -> Array of textures, for the current strictness / plural option
+var _word_tex_cache = {}
+# Debounce: apply a slider change once it stops moving (msec, 0 = none)
+var _strict_apply_at = 0
+# Strictness to (re)push into DD's slider once the library panel shows up:
+# ObjectLibraryPanel.Load() restores its saved strictness one frame after
+# the Object tool opens, which would undo the value we set (see
+# _maintain_library_strictness). null = nothing pending.
+var _pending_dd_strictness = null
+var _pending_dd_frames = 0
+var _library_was_visible = false
+var _warned_no_strictness = false
+# Array of [CheckBox, word] for the word picker of the current reference
+var _lookup_word_checks = []
+var _last_lookup_sig = ""
+
 func _on_search_confirmed() -> void:
-	if tabs != null and tabs.current_tab == 1:
+	if tabs != null and tabs.current_tab == TAB_LIBRARY:
+		run_library_lookup()
+	elif tabs != null and tabs.current_tab == TAB_SIMILAR:
 		run_select_similar()
 	else:
 		search_and_select_all()
@@ -139,13 +174,16 @@ func create_search_dialog() -> void:
 	# Manual tabs: a Tabs bar + two content boxes swapped by visibility.
 	# Unlike TabContainer, a VBoxContainer ignores hidden children in its
 	# minimum size, so each tab gets its own compact height.
-	var root_box = VBoxContainer.new()
+	root_box = VBoxContainer.new()
 	root_box.rect_min_size = Vector2(340, 0)
 	search_dialog.add_child(root_box)
 
 	tabs = Tabs.new()
 	tabs.add_tab("Search Keyword")
 	tabs.add_tab("Select Similar")
+	tabs.add_tab("Find in Library")
+	# Left-aligned: centered tabs need twice the arrow room to all fit
+	tabs.tab_align = Tabs.ALIGN_LEFT
 	tabs.connect("tab_changed", self, "_on_tab_changed")
 	root_box.add_child(tabs)
 
@@ -199,6 +237,58 @@ func create_search_dialog() -> void:
 	shadow_check.hint_tooltip = "Same Soft Shadow mod settings (or both without a soft shadow)"
 	similar_box.add_child(shadow_check)
 
+	# --- Tab 3: find the reference's name in the Object Library ---
+	lookup_box = VBoxContainer.new()
+	lookup_box.visible = false
+	root_box.add_child(lookup_box)
+
+	lookup_hint = Label.new()
+	lookup_hint.text = "Click an asset on the map to use it as reference."
+	lookup_hint.clip_text = true
+	lookup_hint.rect_min_size = Vector2(320, 0)
+	lookup_hint.add_color_override("font_color", GREY_TEXT)
+	lookup_box.add_child(lookup_hint)
+
+	var words_label = Label.new()
+	words_label.text = "Words to include in the library search:"
+	lookup_box.add_child(words_label)
+
+	# Column count follows the dialog width (see _layout_word_grid)
+	lookup_words_grid = GridContainer.new()
+	lookup_words_grid.columns = 3
+	lookup_words_grid.add_constant_override("hseparation", 12)
+	lookup_box.add_child(lookup_words_grid)
+
+	lookup_box.add_child(HSeparator.new())
+
+	lookup_any_check = CheckBox.new()
+	lookup_any_check.text = "Match any word (instead of all)"
+	lookup_any_check.connect("toggled", self, "_on_lookup_option_toggled")
+	lookup_box.add_child(lookup_any_check)
+
+	lookup_plural_check = CheckBox.new()
+	lookup_plural_check.text = "Include singular / plural forms"
+	lookup_plural_check.pressed = true
+	lookup_plural_check.connect("toggled", self, "_on_lookup_plural_toggled")
+	lookup_box.add_child(lookup_plural_check)
+
+	# Same scale as the strictness slider of DD's Object Library search
+	var strict_row = HBoxContainer.new()
+	lookup_box.add_child(strict_row)
+	var fuzzy_label = Label.new()
+	fuzzy_label.text = "Fuzzy"
+	strict_row.add_child(fuzzy_label)
+	lookup_strictness = _build_strictness_slider()
+	lookup_strictness.connect("value_changed", self, "_on_lookup_strictness_changed")
+	strict_row.add_child(lookup_strictness)
+	var exact_label = Label.new()
+	exact_label.text = "Exact"
+	strict_row.add_child(exact_label)
+
+	lookup_count_label = Label.new()
+	lookup_count_label.add_color_override("font_color", GREY_TEXT)
+	lookup_box.add_child(lookup_count_label)
+
 	# Shared option (below both tabs, single state for both modes)
 	add_selection_check = CheckBox.new()
 	add_selection_check.text = "Add to current selection"
@@ -233,22 +323,71 @@ func show_search_dialog() -> void:
 	if not shadow_check.visible:
 		shadow_check.pressed = false
 	search_dialog.show()
+	_sync_strictness_from_library()
+	_fit_tabs_width()
 	search_dialog.set_as_minsize()
 	if not _dialog_positioned:
 		var vp = search_dialog.get_viewport_rect().size
 		search_dialog.rect_position = ((vp - search_dialog.rect_size) * 0.5).floor()
 		_dialog_positioned = true
 	_last_ref_sig = "-"
-	if tabs.current_tab == 0:
+	_last_lookup_sig = "-"
+	if tabs.current_tab == TAB_KEYWORD:
 		search_input.grab_focus()
 		# Set the flag when the keyword input takes focus
 		Global.Editor.SearchHasFocus = true
 
 
+# Godot 3's Tabs reports a zero minimum width and falls back to scroll
+# arrows when its tabs don't fit: widen the content so every tab shows.
+# Computed while in the tree, so DD's theme (and Enlarge UI) is applied.
+func _fit_tabs_width() -> void:
+	var font = tabs.get_font("font")
+	if font == null:
+		return
+	var sb_fg = tabs.get_stylebox("tab_fg")
+	var sb_bg = tabs.get_stylebox("tab_bg")
+	var pad = 0.0
+	if sb_fg != null:
+		pad = sb_fg.get_minimum_size().x
+	if sb_bg != null:
+		pad = max(pad, sb_bg.get_minimum_size().x)
+	var total = 0.0
+	for i in range(tabs.get_tab_count()):
+		total += font.get_string_size(tabs.get_tab_title(i)).x + pad
+	# Tabs subtracts the width of both scroll arrows from the space it
+	# gives the tabs, even when the arrows are hidden
+	for icon_name in ["increment", "decrement"]:
+		var icon = tabs.get_icon(icon_name)
+		if icon != null:
+			total += icon.get_width()
+	root_box.rect_min_size.x = max(root_box.rect_min_size.x, ceil(total) + 16.0)
+
+
+# Safety net run every frame: if the scroll arrows still show, the tabs
+# don't fit yet, so widen a bit more (converges in a few frames, once).
+func _ensure_all_tabs_visible() -> void:
+	if not tabs.has_method("get_offset_buttons_visible"):
+		return
+	if not tabs.get_offset_buttons_visible():
+		return
+	if tabs.has_method("get_tab_offset") and tabs.get_tab_offset() > 0:
+		# Scrolled by the arrows earlier: scroll back to the first tab
+		tabs.ensure_tab_visible(0)
+		return
+	if root_box.rect_min_size.x < 1200.0:
+		root_box.rect_min_size.x += 8.0
+
+
 func _on_tab_changed(tab: int) -> void:
-	keyword_box.visible = tab == 0
-	similar_box.visible = tab == 1
-	if tab == 0:
+	keyword_box.visible = tab == TAB_KEYWORD
+	similar_box.visible = tab == TAB_SIMILAR
+	lookup_box.visible = tab == TAB_LIBRARY
+	# Add / Remove selection options don't apply to the library lookup
+	add_selection_check.visible = tab != TAB_LIBRARY
+	remove_selection_check.visible = tab != TAB_LIBRARY
+	search_dialog.get_ok().text = "Show in Library" if tab == TAB_LIBRARY else "Search"
+	if tab == TAB_KEYWORD:
 		if search_dialog.visible:
 			search_input.grab_focus()
 	else:
@@ -256,6 +395,7 @@ func _on_tab_changed(tab: int) -> void:
 			search_input.release_focus()
 		Global.Editor.SearchHasFocus = false
 		_last_ref_sig = "-"
+		_last_lookup_sig = "-"
 	# Shrink-wrap the dialog around the newly visible tab
 	search_dialog.call_deferred("set_as_minsize")
 
@@ -277,6 +417,7 @@ func _on_search_entered(text: String) -> void:
 
 func update(delta: float) -> void:
 	if not (fmod(delta, 10.0)): return
+	_maintain_library_strictness()
 	if Global.Editor.Toolset.ToolPanels["SelectTool"].visible:
 
 		var selected = select_tool.Selected
@@ -290,9 +431,12 @@ func update(delta: float) -> void:
 		_dock_button_with_main_group(search_button)
 
 		if search_dialog.visible:
+			_ensure_all_tabs_visible()
 			# Live hint on the Select Similar tab (refreshed on selection change)
-			if tabs.current_tab == 1:
+			if tabs.current_tab == TAB_SIMILAR:
 				_refresh_similar_hint(selected)
+			elif tabs.current_tab == TAB_LIBRARY:
+				_refresh_lookup_words(selected)
 			# Shrink-wrap the dialog whenever its content min size changes
 			var want = search_dialog.get_combined_minimum_size()
 			if search_dialog.rect_size != want:
@@ -1076,6 +1220,519 @@ func _get_thing_name(obj: Node) -> String:
 			if path != "":
 				return path.get_file().get_basename()
 	return obj.name
+
+
+# =====================================================================
+# Find in Library: takes the name of the asset selected on the map,
+# splits it into words (spaces, underscores, hyphens, CamelCase, digits)
+# and lets the user pick which words to search. Matching assets are
+# looked up in the Object Library's own word index (the same table DD's
+# search bar uses, with the same similarity test and strictness) and
+# shown in the Object Tool. Words that match nothing are never shown.
+# =====================================================================
+
+func _get_library_panel():
+	if Global.Editor == null or not is_instance_valid(Global.Editor):
+		return null
+	var panel = Global.Editor.get("ObjectLibraryPanel")
+	if panel == null or not is_instance_valid(panel):
+		return null
+	return panel
+
+
+# word -> Array of thumbnail textures (ObjectLibraryPanel.searchEngine).
+# Reading the C# dictionary converts it in full (thousands of entries), so
+# it is read once and cached; while it is still empty (assets not loaded)
+# the read is retried at most once per second.
+func _get_search_engine() -> Dictionary:
+	if not _se_cache.empty():
+		return _se_cache
+	var now = OS.get_ticks_msec()
+	if now < _se_retry_at:
+		return _se_cache
+	_se_retry_at = now + 1000
+	var panel = _get_library_panel()
+	if panel == null:
+		return _se_cache
+	var se = panel.get("searchEngine")
+	if se is Dictionary and not se.empty():
+		_se_cache = se
+	return _se_cache
+
+
+func _get_library_strictness():
+	var panel = _get_library_panel()
+	if panel == null:
+		return null
+	var slider = panel.get("strictness")
+	if slider != null and is_instance_valid(slider) and slider is Range:
+		return slider
+	if not _warned_no_strictness:
+		_warned_no_strictness = true
+		print("Find in Library: could not reach the Object Library's strictness slider")
+	return null
+
+
+# Our slider is a copy of DD's own (same look, range and step)
+func _build_strictness_slider() -> HSlider:
+	var slider = null
+	var dd_slider = _get_library_strictness()
+	if dd_slider != null and dd_slider is HSlider:
+		# Flags 0: properties only, no script and no signal connections
+		slider = dd_slider.duplicate(0)
+	if slider == null or not (slider is HSlider):
+		slider = HSlider.new()
+		slider.min_value = 0.0
+		slider.max_value = 1.0
+		slider.step = 0.01
+		slider.value = 0.5
+	slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	slider.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	slider.hint_tooltip = "Same strictness as the Object Library's search (both sliders stay in sync)"
+	return slider
+
+
+# DD's slider -> ours (on dialog open, and whenever DD's value changes)
+func _sync_strictness_from_library() -> void:
+	var slider = _get_library_strictness()
+	if slider == null:
+		return
+	if _pending_dd_strictness != null:
+		# Our value wins until DD's panel has taken it for good
+		if slider.value != _pending_dd_strictness:
+			slider.value = _pending_dd_strictness
+		return
+	if lookup_strictness.min_value != slider.min_value or lookup_strictness.max_value != slider.max_value:
+		lookup_strictness.min_value = slider.min_value
+		lookup_strictness.max_value = slider.max_value
+		lookup_strictness.step = slider.step
+	if lookup_strictness.value != slider.value:
+		lookup_strictness.value = slider.value
+
+
+func _on_lookup_strictness_changed(value: float) -> void:
+	# Ours -> DD's, right away, so both sliders always show the same value
+	var slider = _get_library_strictness()
+	if slider != null and slider.value != value:
+		slider.value = value
+	_pending_dd_strictness = value
+	_word_tex_cache = {}
+	# Recount once the slider stops moving (recounting is not free)
+	_strict_apply_at = OS.get_ticks_msec() + 150
+
+
+func _on_lookup_option_toggled(_pressed: bool) -> void:
+	_apply_lookup_state()
+
+
+func _on_lookup_plural_toggled(_pressed: bool) -> void:
+	# Similarities were computed against the singular/plural forms
+	_word_sims = {}
+	_word_tex_cache = {}
+	_apply_lookup_state()
+
+
+func _on_lookup_word_toggled(_pressed: bool) -> void:
+	_update_lookup_count()
+
+
+# Called every frame while the tab is visible: cheap unless the reference
+# changed or a slider change is waiting to be applied.
+func _refresh_lookup_words(selected: Array) -> void:
+	_layout_word_grid()
+	_sync_strictness_from_library()
+	if _strict_apply_at > 0 and OS.get_ticks_msec() >= _strict_apply_at:
+		_strict_apply_at = 0
+		_apply_lookup_state()
+
+	var se = _get_search_engine()
+	var sig = "ready" if not se.empty() else "wait"
+	if selected.size() > 0 and is_instance_valid(selected[0]):
+		sig += "_" + str(selected[0].get_instance_id())
+	if sig == _last_lookup_sig:
+		return
+	_last_lookup_sig = sig
+
+	for child in lookup_words_grid.get_children():
+		lookup_words_grid.remove_child(child)
+		child.queue_free()
+	_lookup_word_checks = []
+
+	if selected.size() == 0 or not is_instance_valid(selected[0]):
+		lookup_hint.text = "Click an asset on the map to use it as reference."
+		lookup_count_label.text = ""
+		return
+
+	var ref_name = _get_thing_name(selected[0])
+	if selected.size() > 1:
+		lookup_hint.text = "Reference: %s (first of %d selected)" % [ref_name, selected.size()]
+	else:
+		lookup_hint.text = "Reference: %s" % ref_name
+
+	if se.empty():
+		lookup_count_label.text = "Library index not ready: open the Object tool once."
+		return
+
+	var candidates = _split_name_words(ref_name)
+	for c in candidates:
+		var w: String = c["word"]
+		var check = CheckBox.new()
+		check.text = w.substr(0, 1).to_upper() + w.substr(1)
+		var default_on = c["default"]
+		if c.has("parts"):
+			# Compound token ("WoodenTable"): only checked when none of its
+			# sub-words find anything on their own
+			default_on = true
+			for part in c["parts"]:
+				if _word_matches_anything(part):
+					default_on = false
+					break
+		check.pressed = default_on
+		check.hint_tooltip = "Include \"" + w + "\" in the library search"
+		check.connect("toggled", self, "_on_lookup_word_toggled")
+		lookup_words_grid.add_child(check)
+		_lookup_word_checks.append([check, w])
+
+	_apply_lookup_state()
+
+
+# Fits as many words per row as the dialog width allows (Godot 3 has no
+# flow container): columns sized on the widest visible word
+func _layout_word_grid() -> void:
+	var widest = 0.0
+	var shown = 0
+	for entry in _lookup_word_checks:
+		var check = entry[0]
+		if is_instance_valid(check) and check.visible:
+			shown += 1
+			widest = max(widest, check.get_combined_minimum_size().x)
+	if shown == 0 or widest <= 0.0:
+		return
+	var sep = float(lookup_words_grid.get_constant("hseparation"))
+	var avail = max(lookup_box.rect_size.x, root_box.rect_min_size.x)
+	var cols = int(clamp(floor((avail + sep) / (widest + sep)), 1, shown))
+	if lookup_words_grid.columns != cols:
+		lookup_words_grid.columns = cols
+
+
+# Shows only the words that find something at the current strictness,
+# then updates the count
+func _apply_lookup_state() -> void:
+	var shown = 0
+	for entry in _lookup_word_checks:
+		var check = entry[0]
+		if not is_instance_valid(check):
+			continue
+		check.visible = _word_matches_anything(entry[1])
+		if check.visible:
+			shown += 1
+	if _lookup_word_checks.size() > 0 and shown == 0:
+		lookup_count_label.text = "No word of this name matches the library."
+		return
+	_update_lookup_count()
+
+
+func _checked_lookup_words() -> Array:
+	var words = []
+	for entry in _lookup_word_checks:
+		var check = entry[0]
+		if is_instance_valid(check) and check.visible and check.pressed:
+			words.append(entry[1])
+	return words
+
+
+func _update_lookup_count() -> void:
+	if _lookup_word_checks.size() == 0:
+		return
+	if _checked_lookup_words().size() == 0:
+		lookup_count_label.text = "Check at least one word."
+		return
+	var n = _compute_lookup_textures().size()
+	lookup_count_label.text = "%d matching asset(s) in the library" % n
+
+
+# Splits an asset name into candidate words, lowercase, in name order.
+# Returns Array of {word, default[, parts]}. Single characters are left
+# out ("x" of "2x1"); numbers ("01") are offered but unchecked.
+func _split_name_words(asset_name: String) -> Array:
+	var cleaned = asset_name
+	for sep in ["_", "-", ".", ",", "(", ")", "[", "]", "/", "\\"]:
+		cleaned = cleaned.replace(sep, " ")
+	var out = []
+	var seen = {}
+	for token in cleaned.split(" ", false):
+		var parts = _split_camel(token)
+		var lower_parts = []
+		for part in parts:
+			var w = part.to_lower()
+			lower_parts.append(w)
+			if w.length() < 2 or seen.has(w):
+				continue
+			seen[w] = true
+			out.append({"word": w, "default": not w.is_valid_integer()})
+		# DD may index a CamelCase token whole ("woodentable"): offer it too
+		var whole = token.to_lower()
+		if parts.size() > 1 and not seen.has(whole):
+			seen[whole] = true
+			out.append({"word": whole, "default": false, "parts": lower_parts})
+	return out
+
+
+# "WoodenTable01" -> ["Wooden", "Table", "01"], "HTMLLamp" -> ["HTML", "Lamp"]
+func _split_camel(token: String) -> Array:
+	var parts = []
+	var current = ""
+	var n = token.length()
+	for i in range(n):
+		var c = token[i]
+		if current != "":
+			var prev = token[i - 1]
+			var split = false
+			if _is_digit(c) != _is_digit(prev):
+				split = true
+			elif _is_upper(c) and _is_lower(prev):
+				split = true
+			elif _is_upper(c) and _is_upper(prev) and i + 1 < n and _is_lower(token[i + 1]):
+				split = true
+			if split:
+				parts.append(current)
+				current = ""
+		current += c
+	if current != "":
+		parts.append(current)
+	return parts
+
+
+func _is_digit(c: String) -> bool:
+	return c >= "0" and c <= "9"
+
+
+func _is_upper(c: String) -> bool:
+	return c != c.to_lower() and c == c.to_upper()
+
+
+func _is_lower(c: String) -> bool:
+	return c != c.to_upper() and c == c.to_lower()
+
+
+func _word_forms(word: String) -> Array:
+	if lookup_plural_check.pressed:
+		return _term_variants(word)
+	return [word]
+
+
+func _is_exact_strictness() -> bool:
+	return lookup_strictness.value >= lookup_strictness.max_value
+
+
+# Similarity of every index word to `word` (best over its forms), computed
+# ONCE per word and cached: moving the slider then only re-filters these
+# numbers instead of re-running thousands of comparisons.
+# Returns [keys: Array, sims: PoolRealArray], only keys with similarity > 0.
+func _get_word_sims(word: String) -> Array:
+	if _word_sims.has(word):
+		return _word_sims[word]
+	var se = _get_search_engine()
+	var forms = _word_forms(word)
+	var keys = []
+	var sims = PoolRealArray()
+	for key in se:
+		var best = 0.0
+		for form in forms:
+			var s = key.similarity(form)
+			if s > best:
+				best = s
+		if best > 0.0:
+			keys.append(key)
+			sims.append(best)
+	var res = [keys, sims]
+	_word_sims[word] = res
+	return res
+
+
+# Index words matching `word` at the current strictness. Same test as DD's
+# search bar: key.similarity(term) >= strictness (String.similarity is the
+# Godot function DD's C# calls).
+func _matching_keys(word: String) -> Array:
+	var se = _get_search_engine()
+	if _is_exact_strictness():
+		var exact = []
+		for form in _word_forms(word):
+			if se.has(form):
+				exact.append(form)
+		return exact
+	var threshold = lookup_strictness.value
+	if threshold <= 0.0:
+		# Similarity >= 0 is always true: DD matches every index word
+		return se.keys()
+	var data = _get_word_sims(word)
+	var keys: Array = data[0]
+	var sims: PoolRealArray = data[1]
+	var out = []
+	for i in range(keys.size()):
+		if sims[i] >= threshold:
+			out.append(keys[i])
+	return out
+
+
+func _word_matches_anything(word: String) -> bool:
+	return _textures_for_word(word).size() > 0
+
+
+# Library textures carrying a word at the current strictness, deduplicated
+func _textures_for_word(word: String) -> Array:
+	if _word_tex_cache.has(word):
+		return _word_tex_cache[word]
+	var se = _get_search_engine()
+	var out = []
+	var seen = {}
+	for key in _matching_keys(word):
+		var arr = se[key]
+		if not (arr is Array):
+			continue
+		for tex in arr:
+			if tex == null or seen.has(tex):
+				continue
+			seen[tex] = true
+			out.append(tex)
+	_word_tex_cache[word] = out
+	return out
+
+
+# Same plural heuristics as Theme Search: bogus forms never match the index
+func _term_variants(term: String) -> Array:
+	var variants = [term]
+	if term.ends_with("y") and term.length() > 2:
+		if "aeiou".find(term[term.length() - 2]) != -1:
+			variants.append(term + "s")
+		else:
+			variants.append(term.substr(0, term.length() - 1) + "ies")
+	else:
+		variants.append(term + "s")
+		variants.append(term + "es")
+	if term.ends_with("ies") and term.length() > 4:
+		variants.append(term.substr(0, term.length() - 3) + "y")
+	elif term.ends_with("es") and term.length() > 3:
+		variants.append(term.substr(0, term.length() - 2))
+	if term.ends_with("s") and term.length() > 2:
+		variants.append(term.substr(0, term.length() - 1))
+	if term.ends_with("fe") and term.length() > 3:
+		variants.append(term.substr(0, term.length() - 2) + "ves")
+	elif term.ends_with("f") and term.length() > 2:
+		variants.append(term.substr(0, term.length() - 1) + "ves")
+	if term.ends_with("ves") and term.length() > 4:
+		variants.append(term.substr(0, term.length() - 3) + "f")
+		variants.append(term.substr(0, term.length() - 3) + "fe")
+	return variants
+
+
+# All checked words (AND, like DD's multi-word search) or any of them (OR)
+func _compute_lookup_textures() -> Array:
+	var words = _checked_lookup_words()
+	if words.size() == 0:
+		return []
+	var result = _textures_for_word(words[0]).duplicate()
+	if lookup_any_check.pressed:
+		var seen = {}
+		for tex in result:
+			seen[tex] = true
+		for i in range(1, words.size()):
+			for tex in _textures_for_word(words[i]):
+				if not seen.has(tex):
+					seen[tex] = true
+					result.append(tex)
+		return result
+	for i in range(1, words.size()):
+		var keep = {}
+		for tex in _textures_for_word(words[i]):
+			keep[tex] = true
+		var filtered = []
+		for tex in result:
+			if keep.has(tex):
+				filtered.append(tex)
+		result = filtered
+		if result.empty():
+			break
+	return result
+
+
+func run_library_lookup() -> void:
+	# A slider change still waiting to be applied must be taken into account
+	_word_tex_cache = {}
+	_strict_apply_at = 0
+	_apply_lookup_state()
+	var words = _checked_lookup_words()
+	if words.size() == 0:
+		lookup_count_label.text = "Check at least one word."
+		return
+	var textures = _compute_lookup_textures()
+	if textures.size() == 0:
+		lookup_count_label.text = "No library asset matches these words."
+		return
+	# Make sure DD's slider shows the value the search was run with, and
+	# keeps it after the Object tool restores its saved panel state
+	var slider = _get_library_strictness()
+	if slider != null and slider.value != lookup_strictness.value:
+		slider.value = lookup_strictness.value
+	_pending_dd_strictness = lookup_strictness.value
+	# Switching tool hides the Select Tool panel, which closes this dialog
+	var toolset = Global.Editor.get("Toolset")
+	if toolset != null and is_instance_valid(toolset) and toolset.has_method("Quickswitch"):
+		toolset.Quickswitch("ObjectTool")
+	# One frame of slack so the library panel is shown before we fill it
+	call_deferred("_show_in_library", textures, words)
+
+
+func _show_in_library(textures: Array, words: Array) -> void:
+	var panel = _get_library_panel()
+	if panel == null:
+		return
+	# "All" tab, so the panel state matches what we display
+	var all_btn = panel.get("allButton")
+	if all_btn != null and is_instance_valid(all_btn) and not all_btn.pressed:
+		all_btn.pressed = true
+		if all_btn.has_signal("toggled"):
+			all_btn.emit_signal("toggled", true)
+	panel.call("ShowObjectsArray", textures)
+	# Cosmetic: reflect the words in the search bar without submitting it
+	# (submitting would run DD's own search and replace our result)
+	var le = _find_search_line_edit(panel)
+	if le != null:
+		le.text = PoolStringArray(words).join(" ")
+	print("Find in Library: showing ", textures.size(), " asset(s) for '", PoolStringArray(words).join(" "), "'")
+
+
+# Entering the Object (or Scatter) tool calls ObjectLibraryPanel.Load(),
+# which sets the slider back to the value saved when that tool was left,
+# one frame later (after "await Global.FrameSignal"). So when the panel
+# becomes visible with a value pending, keep re-applying it for a few
+# frames, until DD's restore has run; the tool then saves our value itself.
+func _maintain_library_strictness() -> void:
+	var panel = _get_library_panel()
+	var vis = panel != null and panel.is_visible_in_tree()
+	if vis and not _library_was_visible and _pending_dd_strictness != null:
+		_pending_dd_frames = 10
+	_library_was_visible = vis
+	if _pending_dd_frames <= 0:
+		return
+	_pending_dd_frames -= 1
+	var slider = _get_library_strictness()
+	if slider != null and slider.value != _pending_dd_strictness:
+		slider.value = _pending_dd_strictness
+	if _pending_dd_frames == 0:
+		_pending_dd_strictness = null
+
+
+func _find_search_line_edit(root):
+	if root == null or not is_instance_valid(root):
+		return null
+	if root is LineEdit and root.is_visible_in_tree():
+		return root
+	for child in root.get_children():
+		var found = _find_search_line_edit(child)
+		if found != null:
+			return found
+	return null
 
 
 # --- Panel layout / icon helpers ---------------------------------------

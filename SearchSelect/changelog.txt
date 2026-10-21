@@ -1,6 +1,9 @@
 SEARCH & SELECT
 
-v1.1.3
+v1.4.0
+- Added a new tab: "Find in library", to search for similar assets in the object tool 
+
+v1.1.3 (10/10/2026)
 - Added a "Remove from selection" option
 
 v1.1.2 (06/09/2026)
